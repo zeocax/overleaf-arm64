@@ -1,0 +1,224 @@
+name: Build Overleaf CE ARM64 (TeX Live Full)
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/build.yml'
+  schedule:
+    # Daily check at 19:25 UTC (03:25 UTC+8); exits in ~3s if upstream has not changed
+    - cron: '25 19 * * *'
+  workflow_dispatch:
+    inputs:
+      overleaf_ref:
+        description: 'Official overleaf/overleaf branch or 40-char commit SHA'
+        required: false
+        default: 'main'
+        type: string
+      force_rebuild:
+        description: 'Rebuild app image even if this commit SHA is already built'
+        required: false
+        default: false
+        type: boolean
+      force_rebuild_base:
+        description: 'Force rebuild base image (Node.js + TeX Live scheme-full)'
+        required: false
+        default: false
+        type: boolean
+      texlive_mirror:
+        description: 'Optional CTAN tlnet mirror URL override'
+        required: false
+        default: ''
+        type: string
+
+concurrency:
+  group: overleaf-arm64-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check upstream Overleaf revision & existing GHCR image
+        id: check
+        run: |
+          set -euo pipefail
+          IMAGE_REPO=$(echo "${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          REF="${{ inputs.overleaf_ref || 'main' }}"
+
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            COMMIT_SHA="$REF"
+          else
+            COMMIT_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git "refs/heads/${REF}" | awk '{print $1}')
+            if [[ -z "$COMMIT_SHA" ]]; then
+              COMMIT_SHA=$(git ls-remote https://github.com/overleaf/overleaf.git "${REF}" | head -n1 | awk '{print $1}')
+            fi
+          fi
+
+          if [[ -z "$COMMIT_SHA" ]]; then
+            echo "Failed to resolve upstream ref: $REF" >&2
+            exit 1
+          fi
+
+          SHORT_SHA="${COMMIT_SHA:0:12}"
+          echo "image_repo=${IMAGE_REPO}" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=${COMMIT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "short_sha=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          echo "Resolved overleaf/overleaf (${REF}) -> ${COMMIT_SHA}"
+
+          FORCE_APP="${{ inputs.force_rebuild || 'false' }}"
+          FORCE_BASE="${{ inputs.force_rebuild_base || 'false' }}"
+
+          if [[ "$FORCE_APP" != "true" && "$FORCE_BASE" != "true" ]]; then
+            if docker manifest inspect "ghcr.io/${IMAGE_REPO}:sha-${SHORT_SHA}" >/dev/null 2>&1; then
+              echo "Image ghcr.io/${IMAGE_REPO}:sha-${SHORT_SHA} already exists. Nothing to build."
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+
+      - name: Reclaim runner disk space for TeX Live scheme-full
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          echo "=== Disk space before cleanup ==="
+          df -h /
+          sudo rm -rf \
+            /usr/share/dotnet \
+            /usr/local/lib/android \
+            /opt/ghc \
+            /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost \
+            2>/dev/null || true
+          docker system prune -af || true
+          echo "=== Disk space after cleanup ==="
+          df -h /
+
+      - name: Fetch official overleaf/overleaf source & check base layer
+        id: source
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          COMMIT_SHA="${{ steps.check.outputs.commit_sha }}"
+          IMAGE_REPO="${{ steps.check.outputs.image_repo }}"
+          FORCE_BASE="${{ inputs.force_rebuild_base || 'false' }}"
+
+          mkdir -p overleaf-src
+          cd overleaf-src
+          git init
+          git remote add origin https://github.com/overleaf/overleaf.git
+          git fetch --depth 1 origin "${COMMIT_SHA}"
+          git checkout FETCH_HEAD
+
+          # Upgrade TeX Live installation in official Dockerfile-base from scheme-basic to scheme-full
+          sed -i 's/selected_scheme scheme-basic/selected_scheme scheme-full/' server-ce/Dockerfile-base
+          grep -q "selected_scheme scheme-full" server-ce/Dockerfile-base
+
+          BASE_HASH=$(sha256sum server-ce/Dockerfile-base | cut -c1-12)
+          echo "base_hash=${BASE_HASH}" >> "$GITHUB_OUTPUT"
+          echo "Computed Dockerfile-base (scheme-full) hash: ${BASE_HASH}"
+
+          if [[ "$FORCE_BASE" != "true" ]] && docker manifest inspect "ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}" >/dev/null 2>&1; then
+            echo "Found cached base image ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}, pulling..."
+            docker pull "ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}"
+            echo "need_base=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Base image ghcr.io/${IMAGE_REPO}:base-${BASE_HASH} needs to be built."
+            echo "need_base=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push Overleaf ARM64 base image (TeX Live scheme-full)
+        if: steps.check.outputs.should_build == 'true' && steps.source.outputs.need_base == 'true'
+        working-directory: overleaf-src
+        run: |
+          set -euo pipefail
+          IMAGE_REPO="${{ steps.check.outputs.image_repo }}"
+          BASE_HASH="${{ steps.source.outputs.base_hash }}"
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+          CUSTOM_MIRROR="${{ inputs.texlive_mirror }}"
+
+          MIRROR=""
+          if [[ -n "$CUSTOM_MIRROR" ]]; then
+            MIRROR="$CUSTOM_MIRROR"
+          else
+            for candidate in \
+              "https://mirrors.rit.edu/CTAN/systems/texlive/tlnet" \
+              "https://ctan.math.illinois.edu/systems/texlive/tlnet" \
+              "https://mirror.ox.ac.uk/sites/ctan.org/systems/texlive/tlnet" \
+              "https://ctan.crest.fr/tex-archive/systems/texlive/tlnet"; do
+              if curl -fsSI --max-time 8 "${candidate}/install-tl-unx.tar.gz.sha512" >/dev/null 2>&1 && \
+                 curl -fsSI --max-time 8 "${candidate}/tlpkg/texlive.tlpdb.sha512" >/dev/null 2>&1; then
+                MIRROR="$candidate"
+                break
+              fi
+            done
+          fi
+
+          if [[ -z "$MIRROR" ]]; then
+            MIRROR="https://mirror.ox.ac.uk/sites/ctan.org/systems/texlive/tlnet"
+          fi
+          echo "Using CTAN mirror: ${MIRROR}"
+
+          cp server-ce/.dockerignore .dockerignore
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            --pull \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --build-arg TEXLIVE_MIRROR="${MIRROR}" \
+            --label "org.opencontainers.image.source=${REPO_URL}" \
+            --file server-ce/Dockerfile-base \
+            --tag "ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}" \
+            --tag "ghcr.io/${IMAGE_REPO}:base-latest" \
+            .
+
+          docker push "ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}"
+          docker push "ghcr.io/${IMAGE_REPO}:base-latest"
+
+      - name: Build and push Overleaf CE ARM64 application image
+        if: steps.check.outputs.should_build == 'true'
+        working-directory: overleaf-src
+        run: |
+          set -euo pipefail
+          IMAGE_REPO="${{ steps.check.outputs.image_repo }}"
+          BASE_HASH="${{ steps.source.outputs.base_hash }}"
+          COMMIT_SHA="${{ steps.check.outputs.commit_sha }}"
+          SHORT_SHA="${{ steps.check.outputs.short_sha }}"
+          DATE_TAG=$(date -u +%Y%m%d)
+          REPO_URL="${{ github.server_url }}/${{ github.repository }}"
+
+          cp server-ce/.dockerignore .dockerignore
+          DOCKER_BUILDKIT=1 docker build \
+            --progress=plain \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
+            --build-arg OVERLEAF_BASE_TAG="ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}" \
+            --cache-from "ghcr.io/${IMAGE_REPO}:latest" \
+            --label "org.opencontainers.image.source=${REPO_URL}" \
+            --label "com.overleaf.ce.revision=${COMMIT_SHA}" \
+            --file server-ce/Dockerfile \
+            --tag "ghcr.io/${IMAGE_REPO}:latest" \
+            --tag "ghcr.io/${IMAGE_REPO}:sha-${SHORT_SHA}" \
+            --tag "ghcr.io/${IMAGE_REPO}:${DATE_TAG}" \
+            .
+
+          docker push "ghcr.io/${IMAGE_REPO}:latest"
+          docker push "ghcr.io/${IMAGE_REPO}:sha-${SHORT_SHA}"
+          docker push "ghcr.io/${IMAGE_REPO}:${DATE_TAG}"
+
+          echo "Successfully published:"
+          echo "  - ghcr.io/${IMAGE_REPO}:latest"
+          echo "  - ghcr.io/${IMAGE_REPO}:sha-${SHORT_SHA}"
+          echo "  - ghcr.io/${IMAGE_REPO}:${DATE_TAG}"
