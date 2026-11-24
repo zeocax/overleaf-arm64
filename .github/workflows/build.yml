@@ -97,14 +97,21 @@ jobs:
         run: |
           echo "=== Disk space before cleanup ==="
           df -h /
+          sudo du -sh /opt/* /usr/local/* /usr/share/* 2>/dev/null | sort -hr | head -n 20 || true
           sudo rm -rf \
+            /opt/hostedtoolcache/* \
             /usr/share/dotnet \
+            /usr/share/swift \
             /usr/local/lib/android \
+            /usr/local/aws-cli \
+            /usr/local/aws-sam-cli \
+            /usr/local/share/powershell \
             /opt/ghc \
-            /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost \
+            /var/cache/apt/archives/* \
+            /var/lib/apt/lists/* \
             2>/dev/null || true
-          docker system prune -af || true
+          docker system prune -af --volumes || true
           echo "=== Disk space after cleanup ==="
           df -h /
 
@@ -187,6 +194,8 @@ jobs:
 
           docker push "ghcr.io/${IMAGE_REPO}:base-${BASE_HASH}"
           docker push "ghcr.io/${IMAGE_REPO}:base-latest"
+          docker builder prune -af || true
+          df -h /
 
       - name: Build and push Overleaf CE ARM64 application image
         if: steps.check.outputs.should_build == 'true'
@@ -200,6 +209,8 @@ jobs:
           DATE_TAG=$(date -u +%Y%m%d)
           REPO_URL="${{ github.server_url }}/${{ github.repository }}"
 
+          echo "=== Disk space before app build ==="
+          df -h /
           cp server-ce/.dockerignore .dockerignore
           DOCKER_BUILDKIT=1 docker build \
             --progress=plain \
@@ -214,6 +225,8 @@ jobs:
             --tag "ghcr.io/${IMAGE_REPO}:${DATE_TAG}" \
             .
 
+          docker builder prune -af || true
+          df -h /
           docker push "ghcr.io/${IMAGE_REPO}:latest"
           docker push "ghcr.io/${IMAGE_REPO}:sha-${SHORT_SHA}"
           docker push "ghcr.io/${IMAGE_REPO}:${DATE_TAG}"
